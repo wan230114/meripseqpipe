@@ -6,3 +6,7 @@ results/
 tests/
 testing/
 *.pyc
+.Rproj.user
+Relese_20211116/
+m6a_plot--new/Guitar/
+m6a_plot--new/nextflow-change/all-motif/all-motif-images/

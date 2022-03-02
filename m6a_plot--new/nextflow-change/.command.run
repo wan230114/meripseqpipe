@@ -1,0 +1,500 @@
+#!/bin/bash
+# NEXTFLOW TASK: QCPeaksReport
+set -e
+set -u
+NXF_DEBUG=${NXF_DEBUG:=0}; [[ $NXF_DEBUG > 1 ]] && set -x
+NXF_ENTRY=${1:-nxf_main}
+
+nxf_tree() {
+    local pid=$1
+
+    declare -a ALL_CHILDREN
+    while read P PP;do
+        ALL_CHILDREN[$PP]+=" $P"
+    done < <(ps -e -o pid= -o ppid=)
+
+    pstat() {
+        local x_pid=$1
+        local STATUS=$(2> /dev/null < /proc/$1/status egrep 'Vm|ctxt')
+
+        if [ $? = 0 ]; then
+        local  x_vsz=$(echo "$STATUS" | grep VmSize | awk '{print $2}' || echo -n '0')
+        local  x_rss=$(echo "$STATUS" | grep VmRSS | awk '{print $2}' || echo -n '0')
+        local x_peak=$(echo "$STATUS" | egrep 'VmPeak|VmHWM' | sed 's/^.*:\s*//' | sed 's/[\sa-zA-Z]*$//' | tr '\n' ' ' || echo -n '0 0')
+        local x_pmem=$(awk -v rss=$x_rss -v mem_tot=$mem_tot 'BEGIN {printf "%.0f", rss/mem_tot*100*10}' || echo -n '0')
+        local vol_ctxt=$(echo "$STATUS" | grep '\bvoluntary_ctxt_switches' | awk '{print $2}' || echo -n '0')
+        local inv_ctxt=$(echo "$STATUS" | grep '\bnonvoluntary_ctxt_switches' | awk '{print $2}' || echo -n '0')
+        cpu_stat[x_pid]="$x_pid $x_pmem $x_vsz $x_rss $x_peak $vol_ctxt $inv_ctxt"
+        fi
+    }
+
+    pwalk() {
+        pstat $1
+        for i in ${ALL_CHILDREN[$1]:=}; do pwalk $i; done
+    }
+
+    pwalk $1
+}
+
+nxf_stat() {
+    cpu_stat=()
+    nxf_tree $1
+
+    declare -a sum=(0 0 0 0 0 0 0 0)
+    local pid
+    local i
+    for pid in "${!cpu_stat[@]}"; do
+        local row=(${cpu_stat[pid]})
+        [ $NXF_DEBUG = 1 ] && echo "++ stat mem=${row[*]}"
+        for i in "${!row[@]}"; do
+        if [ $i != 0 ]; then
+            sum[i]=$((sum[i]+row[i]))
+        fi
+        done
+    done
+
+    [ $NXF_DEBUG = 1 ] && echo -e "++ stat SUM=${sum[*]}"
+
+    for i in {1..7}; do
+        if [ ${sum[i]} -lt ${cpu_peak[i]} ]; then
+            sum[i]=${cpu_peak[i]}
+        else
+            cpu_peak[i]=${sum[i]}
+        fi
+    done
+
+    [ $NXF_DEBUG = 1 ] && echo -e "++ stat PEAK=${sum[*]}\n"
+    nxf_stat_ret=(${sum[*]})
+}
+
+nxf_mem_watch() {
+    set -o pipefail
+    local pid=$1
+    local trace_file=.command.trace
+    local count=0;
+    declare -a cpu_stat=(0 0 0 0 0 0 0 0)
+    declare -a cpu_peak=(0 0 0 0 0 0 0 0)
+    local mem_tot=$(< /proc/meminfo grep MemTotal | awk '{print $2}')
+    local timeout
+    local DONE
+    local STOP=''
+
+    [ $NXF_DEBUG = 1 ] && nxf_sleep 0.2 && ps fx
+
+    while true; do
+        nxf_stat $pid
+        if [ $count -lt 10 ]; then timeout=1;
+        elif [ $count -lt 120 ]; then timeout=5;
+        else timeout=30;
+        fi
+        read -t $timeout -r DONE || true
+        [[ $DONE ]] && break
+        if [ ! -e /proc/$pid ]; then
+            [ ! $STOP ] && STOP=$(nxf_date)
+            [ $(($(nxf_date)-STOP)) -gt 10000 ] && break
+        fi
+        count=$((count+1))
+    done
+
+    echo "%mem=${nxf_stat_ret[1]}"      >> $trace_file
+    echo "vmem=${nxf_stat_ret[2]}"      >> $trace_file
+    echo "rss=${nxf_stat_ret[3]}"       >> $trace_file
+    echo "peak_vmem=${nxf_stat_ret[4]}" >> $trace_file
+    echo "peak_rss=${nxf_stat_ret[5]}"  >> $trace_file
+    echo "vol_ctxt=${nxf_stat_ret[6]}"  >> $trace_file
+    echo "inv_ctxt=${nxf_stat_ret[7]}"  >> $trace_file
+}
+
+nxf_write_trace() {
+    echo "nextflow.trace/v2"           > $trace_file
+    echo "realtime=$wall_time"         >> $trace_file
+    echo "%cpu=$ucpu"                  >> $trace_file
+    echo "rchar=${io_stat1[0]}"        >> $trace_file
+    echo "wchar=${io_stat1[1]}"        >> $trace_file
+    echo "syscr=${io_stat1[2]}"        >> $trace_file
+    echo "syscw=${io_stat1[3]}"        >> $trace_file
+    echo "read_bytes=${io_stat1[4]}"   >> $trace_file
+    echo "write_bytes=${io_stat1[5]}"  >> $trace_file
+}
+
+nxf_trace_mac() {
+    local start_millis=$(nxf_date)
+
+    /bin/bash -euo pipefail /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e8/b9beb639ffaee846dfdb3984d10002/.command.sh
+
+    local end_millis=$(nxf_date)
+    local wall_time=$((end_millis-start_millis))
+    local ucpu=''
+    local io_stat1=('' '' '' '' '' '')
+    nxf_write_trace
+}
+
+nxf_fd() {
+    local FD=11
+    while [ -e /proc/$$/fd/$FD ]; do FD=$((FD+1)); done
+    echo $FD
+}
+
+nxf_trace_linux() {
+    local pid=$$
+    command -v ps &>/dev/null || { >&2 echo "Command 'ps' required by nextflow to collect task metrics cannot be found"; exit 1; }
+    local num_cpus=$(< /proc/cpuinfo grep '^processor' -c)
+    local tot_time0=$(grep '^cpu ' /proc/stat | awk '{sum=$2+$3+$4+$5+$6+$7+$8+$9; printf "%.0f",sum}')
+    local cpu_time0=$(2> /dev/null < /proc/$pid/stat awk '{printf "%.0f", ($16+$17)*10 }' || echo -n 'X')
+    local io_stat0=($(2> /dev/null < /proc/$pid/io sed 's/^.*:\s*//' | head -n 6 | tr '\n' ' ' || echo -n '0 0 0 0 0 0'))
+    local start_millis=$(nxf_date)
+    trap 'kill $mem_proc' ERR
+    
+    /bin/bash -euo pipefail /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e8/b9beb639ffaee846dfdb3984d10002/.command.sh &
+    local task=$!
+
+    mem_fd=$(nxf_fd)
+    eval "exec $mem_fd> >(nxf_mem_watch $task)"
+    local mem_proc=$!
+
+    wait $task
+
+    local end_millis=$(nxf_date)
+    local tot_time1=$(grep '^cpu ' /proc/stat | awk '{sum=$2+$3+$4+$5+$6+$7+$8+$9; printf "%.0f",sum}')
+    local cpu_time1=$(2> /dev/null < /proc/$pid/stat awk '{printf "%.0f", ($16+$17)*10 }' || echo -n 'X')
+    local ucpu=$(awk -v p1=$cpu_time1 -v p0=$cpu_time0 -v t1=$tot_time1 -v t0=$tot_time0 -v n=$num_cpus 'BEGIN { pct=(p1-p0)/(t1-t0)*100*n; printf("%.0f", pct>0 ? pct : 0) }' )
+
+    local io_stat1=($(2> /dev/null < /proc/$pid/io sed 's/^.*:\s*//' | head -n 6 | tr '\n' ' ' || echo -n '0 0 0 0 0 0'))
+    local i
+    for i in {0..5}; do
+        io_stat1[i]=$((io_stat1[i]-io_stat0[i]))
+    done
+
+    local wall_time=$((end_millis-start_millis))
+    [ $NXF_DEBUG = 1 ] && echo "+++ STATS %CPU=$ucpu TIME=$wall_time I/O=${io_stat1[*]}"
+
+    echo "nextflow.trace/v2"           > $trace_file
+    echo "realtime=$wall_time"         >> $trace_file
+    echo "%cpu=$ucpu"                  >> $trace_file
+    echo "rchar=${io_stat1[0]}"        >> $trace_file
+    echo "wchar=${io_stat1[1]}"        >> $trace_file
+    echo "syscr=${io_stat1[2]}"        >> $trace_file
+    echo "syscw=${io_stat1[3]}"        >> $trace_file
+    echo "read_bytes=${io_stat1[4]}"   >> $trace_file
+    echo "write_bytes=${io_stat1[5]}"  >> $trace_file
+
+    [ -e /proc/$mem_proc ] && eval "echo 'DONE' >&$mem_fd" || true
+    wait $mem_proc 2>/dev/null || true
+    while [ -e /proc/$mem_proc ]; do nxf_sleep 0.1; done
+}
+
+nxf_trace() {
+    local trace_file=.command.trace
+    touch $trace_file
+    if [[ $(uname) = Darwin ]]; then
+        nxf_trace_mac
+    else
+        nxf_trace_linux
+    fi
+}
+nxf_container_env() {
+cat << EOF
+export PATH="/work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/bin:\$PATH"
+EOF
+}
+
+nxf_sleep() {
+  sleep $1 2>/dev/null || sleep 1;
+}
+
+nxf_date() {
+    local ts=$(date +%s%3N);
+    if [[ ${#ts} == 10 ]]; then echo ${ts}000
+    elif [[ $ts == *%3N ]]; then echo ${ts/\%3N/000}
+    elif [[ $ts == *3N ]]; then echo ${ts/3N/000}
+    elif [[ ${#ts} == 13 ]]; then echo $ts
+    else echo "Unexpected timestamp value: $ts"; exit 1
+    fi
+}
+
+nxf_env() {
+    echo '============= task environment ============='
+    env | sort | sed "s/\(.*\)AWS\(.*\)=\(.\{6\}\).*/\1AWS\2=\3xxxxxxxxxxxxx/"
+    echo '============= task output =================='
+}
+
+nxf_kill() {
+    declare -a children
+    while read P PP;do
+        children[$PP]+=" $P"
+    done < <(ps -e -o pid= -o ppid=)
+
+    kill_all() {
+        [[ $1 != $$ ]] && kill $1 2>/dev/null || true
+        for i in ${children[$1]:=}; do kill_all $i; done
+    }
+
+    kill_all $1
+}
+
+nxf_mktemp() {
+    local base=${1:-/tmp}
+    if [[ $(uname) = Darwin ]]; then mktemp -d $base/nxf.XXXXXXXXXX
+    else TMPDIR="$base" mktemp -d -t nxf.XXXXXXXXXX
+    fi
+}
+
+on_exit() {
+    exit_status=${nxf_main_ret:=$?}
+    printf $exit_status > /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e8/b9beb639ffaee846dfdb3984d10002/.exitcode
+    set +u
+    [[ "$tee1" ]] && kill $tee1 2>/dev/null
+    [[ "$tee2" ]] && kill $tee2 2>/dev/null
+    [[ "$ctmp" ]] && rm -rf $ctmp || true
+    docker rm $NXF_BOXID &>/dev/null || true
+    exit $exit_status
+}
+
+on_term() {
+    set +e
+    docker kill $NXF_BOXID
+}
+
+nxf_launch() {
+    docker run -i --cpus 30.0 --memory 40960m -e "NXF_DEBUG=${NXF_DEBUG:=0}" -v /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe:/work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe -v "$PWD":"$PWD" -w "$PWD" --entrypoint /bin/bash -u $(id -u):$(id -g) --name $NXF_BOXID kingzhuky/meripseqpipe:dev -c "eval $(nxf_container_env); /bin/bash /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e8/b9beb639ffaee846dfdb3984d10002/.command.run nxf_trace"
+}
+
+nxf_stage() {
+    true
+    # stage input files
+    rm -f rank_merged_allpeaks_homer
+    rm -f rank_merged_group_control_homer
+    rm -f rank_merged_group_treat_homer
+    rm -f MATK_treat-m6A-2_normalized.anno.txt
+    rm -f MATK_treat-m6A-2_normalized.peak_bed.center
+    rm -f MATK_treat-m6A-2_normalized.refSeq.all.bed
+    rm -f MATK_treat-m6A-2_normalized.tmp.refSeq.bed
+    rm -f MATK_treat-m6A-2_normalized.unanno.txt
+    rm -f macs2_treat-m6A-2_normalized.anno.txt
+    rm -f macs2_treat-m6A-2_normalized.peak_bed.center
+    rm -f macs2_treat-m6A-2_normalized.refSeq.all.bed
+    rm -f macs2_treat-m6A-2_normalized.tmp.refSeq.bed
+    rm -f macs2_treat-m6A-2_normalized.unanno.txt
+    rm -f metpeak_group_treat-m6A-1_normalized.anno.txt
+    rm -f metpeak_group_treat-m6A-1_normalized.peak_bed.center
+    rm -f metpeak_group_treat-m6A-1_normalized.refSeq.all.bed
+    rm -f metpeak_group_treat-m6A-1_normalized.tmp.refSeq.bed
+    rm -f metpeak_group_treat-m6A-1_normalized.unanno.txt
+    rm -f metpeak_group_control-m6A-1_normalized.anno.txt
+    rm -f metpeak_group_control-m6A-1_normalized.peak_bed.center
+    rm -f metpeak_group_control-m6A-1_normalized.refSeq.all.bed
+    rm -f metpeak_group_control-m6A-1_normalized.tmp.refSeq.bed
+    rm -f metpeak_group_control-m6A-1_normalized.unanno.txt
+    rm -f meyer_meyer_control-m6A-1_normalized.anno.txt
+    rm -f meyer_meyer_control-m6A-1_normalized.peak_bed.center
+    rm -f meyer_meyer_control-m6A-1_normalized.refSeq.all.bed
+    rm -f meyer_meyer_control-m6A-1_normalized.tmp.refSeq.bed
+    rm -f meyer_meyer_control-m6A-1_normalized.unanno.txt
+    rm -f metpeak_group_control-m6A-2_normalized.anno.txt
+    rm -f metpeak_group_control-m6A-2_normalized.peak_bed.center
+    rm -f metpeak_group_control-m6A-2_normalized.refSeq.all.bed
+    rm -f metpeak_group_control-m6A-2_normalized.tmp.refSeq.bed
+    rm -f metpeak_group_control-m6A-2_normalized.unanno.txt
+    rm -f metpeak_group_treat-m6A-2_normalized.anno.txt
+    rm -f metpeak_group_treat-m6A-2_normalized.peak_bed.center
+    rm -f metpeak_group_treat-m6A-2_normalized.refSeq.all.bed
+    rm -f metpeak_group_treat-m6A-2_normalized.tmp.refSeq.bed
+    rm -f metpeak_group_treat-m6A-2_normalized.unanno.txt
+    rm -f MATK_control-m6A-1_normalized.anno.txt
+    rm -f MATK_control-m6A-1_normalized.peak_bed.center
+    rm -f MATK_control-m6A-1_normalized.refSeq.all.bed
+    rm -f MATK_control-m6A-1_normalized.tmp.refSeq.bed
+    rm -f MATK_control-m6A-1_normalized.unanno.txt
+    rm -f macs2_treat-m6A-1_normalized.anno.txt
+    rm -f macs2_treat-m6A-1_normalized.peak_bed.center
+    rm -f macs2_treat-m6A-1_normalized.refSeq.all.bed
+    rm -f macs2_treat-m6A-1_normalized.tmp.refSeq.bed
+    rm -f macs2_treat-m6A-1_normalized.unanno.txt
+    rm -f MATK_control-m6A-2_normalized.anno.txt
+    rm -f MATK_control-m6A-2_normalized.peak_bed.center
+    rm -f MATK_control-m6A-2_normalized.refSeq.all.bed
+    rm -f MATK_control-m6A-2_normalized.tmp.refSeq.bed
+    rm -f MATK_control-m6A-2_normalized.unanno.txt
+    rm -f meyer_meyer_control-m6A-2_normalized.anno.txt
+    rm -f meyer_meyer_control-m6A-2_normalized.peak_bed.center
+    rm -f meyer_meyer_control-m6A-2_normalized.refSeq.all.bed
+    rm -f meyer_meyer_control-m6A-2_normalized.tmp.refSeq.bed
+    rm -f meyer_meyer_control-m6A-2_normalized.unanno.txt
+    rm -f MATK_treat-m6A-1_normalized.anno.txt
+    rm -f MATK_treat-m6A-1_normalized.peak_bed.center
+    rm -f MATK_treat-m6A-1_normalized.refSeq.all.bed
+    rm -f MATK_treat-m6A-1_normalized.tmp.refSeq.bed
+    rm -f MATK_treat-m6A-1_normalized.unanno.txt
+    rm -f macs2_control-m6A-1_normalized.anno.txt
+    rm -f macs2_control-m6A-1_normalized.peak_bed.center
+    rm -f macs2_control-m6A-1_normalized.refSeq.all.bed
+    rm -f macs2_control-m6A-1_normalized.tmp.refSeq.bed
+    rm -f macs2_control-m6A-1_normalized.unanno.txt
+    rm -f macs2_control-m6A-2_normalized.anno.txt
+    rm -f macs2_control-m6A-2_normalized.peak_bed.center
+    rm -f macs2_control-m6A-2_normalized.refSeq.all.bed
+    rm -f macs2_control-m6A-2_normalized.tmp.refSeq.bed
+    rm -f macs2_control-m6A-2_normalized.unanno.txt
+    rm -f meyer_meyer_treat-m6A-2_normalized.anno.txt
+    rm -f meyer_meyer_treat-m6A-2_normalized.peak_bed.center
+    rm -f meyer_meyer_treat-m6A-2_normalized.refSeq.all.bed
+    rm -f meyer_meyer_treat-m6A-2_normalized.tmp.refSeq.bed
+    rm -f meyer_meyer_treat-m6A-2_normalized.unanno.txt
+    rm -f meyer_meyer_treat-m6A-1_normalized.anno.txt
+    rm -f meyer_meyer_treat-m6A-1_normalized.peak_bed.center
+    rm -f meyer_meyer_treat-m6A-1_normalized.refSeq.all.bed
+    rm -f meyer_meyer_treat-m6A-1_normalized.tmp.refSeq.bed
+    rm -f meyer_meyer_treat-m6A-1_normalized.unanno.txt
+    rm -f rank_merged_group_control.anno.txt
+    rm -f rank_merged_group_control.peak_bed.center
+    rm -f rank_merged_group_control.refSeq.all.bed
+    rm -f rank_merged_group_control.tmp.refSeq.bed
+    rm -f rank_merged_group_control.unanno.txt
+    rm -f rank_merged_group_treat.anno.txt
+    rm -f rank_merged_group_treat.peak_bed.center
+    rm -f rank_merged_group_treat.refSeq.all.bed
+    rm -f rank_merged_group_treat.tmp.refSeq.bed
+    rm -f rank_merged_group_treat.unanno.txt
+    rm -f rank_merged_allpeaks.anno.txt
+    rm -f rank_merged_allpeaks.peak_bed.center
+    rm -f rank_merged_allpeaks.refSeq.all.bed
+    rm -f rank_merged_allpeaks.tmp.refSeq.bed
+    rm -f rank_merged_allpeaks.unanno.txt
+    rm -f formatted_designfile.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/d6/c1d38b07504b2d3690c4889a2659a7/rank_merged_allpeaks_homer rank_merged_allpeaks_homer
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/04/b55261acccf277d1fe83dfea81015b/rank_merged_group_control_homer rank_merged_group_control_homer
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/d7/7e3cbb74e7d0ae3724f49ec7317654/rank_merged_group_treat_homer rank_merged_group_treat_homer
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/95/d78b6749f69ebfb5dabcce3ccf37e7/annotatedbyxy/MATK_treat-m6A-2_normalized.anno.txt MATK_treat-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/95/d78b6749f69ebfb5dabcce3ccf37e7/annotatedbyxy/MATK_treat-m6A-2_normalized.peak_bed.center MATK_treat-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/95/d78b6749f69ebfb5dabcce3ccf37e7/annotatedbyxy/MATK_treat-m6A-2_normalized.refSeq.all.bed MATK_treat-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/95/d78b6749f69ebfb5dabcce3ccf37e7/annotatedbyxy/MATK_treat-m6A-2_normalized.tmp.refSeq.bed MATK_treat-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/95/d78b6749f69ebfb5dabcce3ccf37e7/annotatedbyxy/MATK_treat-m6A-2_normalized.unanno.txt MATK_treat-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/6e/b5ea129805071b3761f844021336d5/annotatedbyxy/macs2_treat-m6A-2_normalized.anno.txt macs2_treat-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/6e/b5ea129805071b3761f844021336d5/annotatedbyxy/macs2_treat-m6A-2_normalized.peak_bed.center macs2_treat-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/6e/b5ea129805071b3761f844021336d5/annotatedbyxy/macs2_treat-m6A-2_normalized.refSeq.all.bed macs2_treat-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/6e/b5ea129805071b3761f844021336d5/annotatedbyxy/macs2_treat-m6A-2_normalized.tmp.refSeq.bed macs2_treat-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/6e/b5ea129805071b3761f844021336d5/annotatedbyxy/macs2_treat-m6A-2_normalized.unanno.txt macs2_treat-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e9/9604c4e02be38d932501c5c9134a5a/annotatedbyxy/metpeak_group_treat-m6A-1_normalized.anno.txt metpeak_group_treat-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e9/9604c4e02be38d932501c5c9134a5a/annotatedbyxy/metpeak_group_treat-m6A-1_normalized.peak_bed.center metpeak_group_treat-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e9/9604c4e02be38d932501c5c9134a5a/annotatedbyxy/metpeak_group_treat-m6A-1_normalized.refSeq.all.bed metpeak_group_treat-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e9/9604c4e02be38d932501c5c9134a5a/annotatedbyxy/metpeak_group_treat-m6A-1_normalized.tmp.refSeq.bed metpeak_group_treat-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e9/9604c4e02be38d932501c5c9134a5a/annotatedbyxy/metpeak_group_treat-m6A-1_normalized.unanno.txt metpeak_group_treat-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/18/0828d4e47fb766ba7e5f4337a015dd/annotatedbyxy/metpeak_group_control-m6A-1_normalized.anno.txt metpeak_group_control-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/18/0828d4e47fb766ba7e5f4337a015dd/annotatedbyxy/metpeak_group_control-m6A-1_normalized.peak_bed.center metpeak_group_control-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/18/0828d4e47fb766ba7e5f4337a015dd/annotatedbyxy/metpeak_group_control-m6A-1_normalized.refSeq.all.bed metpeak_group_control-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/18/0828d4e47fb766ba7e5f4337a015dd/annotatedbyxy/metpeak_group_control-m6A-1_normalized.tmp.refSeq.bed metpeak_group_control-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/18/0828d4e47fb766ba7e5f4337a015dd/annotatedbyxy/metpeak_group_control-m6A-1_normalized.unanno.txt metpeak_group_control-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/96/d6613e59166aba49fed2699708cad8/annotatedbyxy/meyer_meyer_control-m6A-1_normalized.anno.txt meyer_meyer_control-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/96/d6613e59166aba49fed2699708cad8/annotatedbyxy/meyer_meyer_control-m6A-1_normalized.peak_bed.center meyer_meyer_control-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/96/d6613e59166aba49fed2699708cad8/annotatedbyxy/meyer_meyer_control-m6A-1_normalized.refSeq.all.bed meyer_meyer_control-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/96/d6613e59166aba49fed2699708cad8/annotatedbyxy/meyer_meyer_control-m6A-1_normalized.tmp.refSeq.bed meyer_meyer_control-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/96/d6613e59166aba49fed2699708cad8/annotatedbyxy/meyer_meyer_control-m6A-1_normalized.unanno.txt meyer_meyer_control-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/a7/33569f61a4e3f11bd611cfe0f164fd/annotatedbyxy/metpeak_group_control-m6A-2_normalized.anno.txt metpeak_group_control-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/a7/33569f61a4e3f11bd611cfe0f164fd/annotatedbyxy/metpeak_group_control-m6A-2_normalized.peak_bed.center metpeak_group_control-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/a7/33569f61a4e3f11bd611cfe0f164fd/annotatedbyxy/metpeak_group_control-m6A-2_normalized.refSeq.all.bed metpeak_group_control-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/a7/33569f61a4e3f11bd611cfe0f164fd/annotatedbyxy/metpeak_group_control-m6A-2_normalized.tmp.refSeq.bed metpeak_group_control-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/a7/33569f61a4e3f11bd611cfe0f164fd/annotatedbyxy/metpeak_group_control-m6A-2_normalized.unanno.txt metpeak_group_control-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/f4/d164b741b33e243954d5128cbe71f3/annotatedbyxy/metpeak_group_treat-m6A-2_normalized.anno.txt metpeak_group_treat-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/f4/d164b741b33e243954d5128cbe71f3/annotatedbyxy/metpeak_group_treat-m6A-2_normalized.peak_bed.center metpeak_group_treat-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/f4/d164b741b33e243954d5128cbe71f3/annotatedbyxy/metpeak_group_treat-m6A-2_normalized.refSeq.all.bed metpeak_group_treat-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/f4/d164b741b33e243954d5128cbe71f3/annotatedbyxy/metpeak_group_treat-m6A-2_normalized.tmp.refSeq.bed metpeak_group_treat-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/f4/d164b741b33e243954d5128cbe71f3/annotatedbyxy/metpeak_group_treat-m6A-2_normalized.unanno.txt metpeak_group_treat-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/cf/e8b9f0feec7baeaf1af350c890ca3d/annotatedbyxy/MATK_control-m6A-1_normalized.anno.txt MATK_control-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/cf/e8b9f0feec7baeaf1af350c890ca3d/annotatedbyxy/MATK_control-m6A-1_normalized.peak_bed.center MATK_control-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/cf/e8b9f0feec7baeaf1af350c890ca3d/annotatedbyxy/MATK_control-m6A-1_normalized.refSeq.all.bed MATK_control-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/cf/e8b9f0feec7baeaf1af350c890ca3d/annotatedbyxy/MATK_control-m6A-1_normalized.tmp.refSeq.bed MATK_control-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/cf/e8b9f0feec7baeaf1af350c890ca3d/annotatedbyxy/MATK_control-m6A-1_normalized.unanno.txt MATK_control-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/de/3250ae436968109da1b43cccbca474/annotatedbyxy/macs2_treat-m6A-1_normalized.anno.txt macs2_treat-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/de/3250ae436968109da1b43cccbca474/annotatedbyxy/macs2_treat-m6A-1_normalized.peak_bed.center macs2_treat-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/de/3250ae436968109da1b43cccbca474/annotatedbyxy/macs2_treat-m6A-1_normalized.refSeq.all.bed macs2_treat-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/de/3250ae436968109da1b43cccbca474/annotatedbyxy/macs2_treat-m6A-1_normalized.tmp.refSeq.bed macs2_treat-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/de/3250ae436968109da1b43cccbca474/annotatedbyxy/macs2_treat-m6A-1_normalized.unanno.txt macs2_treat-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/54/01e052edc85d011469cfacf1bad4de/annotatedbyxy/MATK_control-m6A-2_normalized.anno.txt MATK_control-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/54/01e052edc85d011469cfacf1bad4de/annotatedbyxy/MATK_control-m6A-2_normalized.peak_bed.center MATK_control-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/54/01e052edc85d011469cfacf1bad4de/annotatedbyxy/MATK_control-m6A-2_normalized.refSeq.all.bed MATK_control-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/54/01e052edc85d011469cfacf1bad4de/annotatedbyxy/MATK_control-m6A-2_normalized.tmp.refSeq.bed MATK_control-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/54/01e052edc85d011469cfacf1bad4de/annotatedbyxy/MATK_control-m6A-2_normalized.unanno.txt MATK_control-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/17/04aa060412c21c0676fd6fc6b55e5a/annotatedbyxy/meyer_meyer_control-m6A-2_normalized.anno.txt meyer_meyer_control-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/17/04aa060412c21c0676fd6fc6b55e5a/annotatedbyxy/meyer_meyer_control-m6A-2_normalized.peak_bed.center meyer_meyer_control-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/17/04aa060412c21c0676fd6fc6b55e5a/annotatedbyxy/meyer_meyer_control-m6A-2_normalized.refSeq.all.bed meyer_meyer_control-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/17/04aa060412c21c0676fd6fc6b55e5a/annotatedbyxy/meyer_meyer_control-m6A-2_normalized.tmp.refSeq.bed meyer_meyer_control-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/17/04aa060412c21c0676fd6fc6b55e5a/annotatedbyxy/meyer_meyer_control-m6A-2_normalized.unanno.txt meyer_meyer_control-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/81/12d0c690ff5e2ced3d643da2ba15f2/annotatedbyxy/MATK_treat-m6A-1_normalized.anno.txt MATK_treat-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/81/12d0c690ff5e2ced3d643da2ba15f2/annotatedbyxy/MATK_treat-m6A-1_normalized.peak_bed.center MATK_treat-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/81/12d0c690ff5e2ced3d643da2ba15f2/annotatedbyxy/MATK_treat-m6A-1_normalized.refSeq.all.bed MATK_treat-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/81/12d0c690ff5e2ced3d643da2ba15f2/annotatedbyxy/MATK_treat-m6A-1_normalized.tmp.refSeq.bed MATK_treat-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/81/12d0c690ff5e2ced3d643da2ba15f2/annotatedbyxy/MATK_treat-m6A-1_normalized.unanno.txt MATK_treat-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/8a/4728e088834ba504628b36c5feb512/annotatedbyxy/macs2_control-m6A-1_normalized.anno.txt macs2_control-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/8a/4728e088834ba504628b36c5feb512/annotatedbyxy/macs2_control-m6A-1_normalized.peak_bed.center macs2_control-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/8a/4728e088834ba504628b36c5feb512/annotatedbyxy/macs2_control-m6A-1_normalized.refSeq.all.bed macs2_control-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/8a/4728e088834ba504628b36c5feb512/annotatedbyxy/macs2_control-m6A-1_normalized.tmp.refSeq.bed macs2_control-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/8a/4728e088834ba504628b36c5feb512/annotatedbyxy/macs2_control-m6A-1_normalized.unanno.txt macs2_control-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/75/b3a3ef6d82f3d78718eaa8bd647204/annotatedbyxy/macs2_control-m6A-2_normalized.anno.txt macs2_control-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/75/b3a3ef6d82f3d78718eaa8bd647204/annotatedbyxy/macs2_control-m6A-2_normalized.peak_bed.center macs2_control-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/75/b3a3ef6d82f3d78718eaa8bd647204/annotatedbyxy/macs2_control-m6A-2_normalized.refSeq.all.bed macs2_control-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/75/b3a3ef6d82f3d78718eaa8bd647204/annotatedbyxy/macs2_control-m6A-2_normalized.tmp.refSeq.bed macs2_control-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/75/b3a3ef6d82f3d78718eaa8bd647204/annotatedbyxy/macs2_control-m6A-2_normalized.unanno.txt macs2_control-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b4/b559a748a0ff4374d9396ac3ea4be9/annotatedbyxy/meyer_meyer_treat-m6A-2_normalized.anno.txt meyer_meyer_treat-m6A-2_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b4/b559a748a0ff4374d9396ac3ea4be9/annotatedbyxy/meyer_meyer_treat-m6A-2_normalized.peak_bed.center meyer_meyer_treat-m6A-2_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b4/b559a748a0ff4374d9396ac3ea4be9/annotatedbyxy/meyer_meyer_treat-m6A-2_normalized.refSeq.all.bed meyer_meyer_treat-m6A-2_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b4/b559a748a0ff4374d9396ac3ea4be9/annotatedbyxy/meyer_meyer_treat-m6A-2_normalized.tmp.refSeq.bed meyer_meyer_treat-m6A-2_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b4/b559a748a0ff4374d9396ac3ea4be9/annotatedbyxy/meyer_meyer_treat-m6A-2_normalized.unanno.txt meyer_meyer_treat-m6A-2_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/fa/e7bba579117db74662d9e9e9e1e2e9/annotatedbyxy/meyer_meyer_treat-m6A-1_normalized.anno.txt meyer_meyer_treat-m6A-1_normalized.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/fa/e7bba579117db74662d9e9e9e1e2e9/annotatedbyxy/meyer_meyer_treat-m6A-1_normalized.peak_bed.center meyer_meyer_treat-m6A-1_normalized.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/fa/e7bba579117db74662d9e9e9e1e2e9/annotatedbyxy/meyer_meyer_treat-m6A-1_normalized.refSeq.all.bed meyer_meyer_treat-m6A-1_normalized.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/fa/e7bba579117db74662d9e9e9e1e2e9/annotatedbyxy/meyer_meyer_treat-m6A-1_normalized.tmp.refSeq.bed meyer_meyer_treat-m6A-1_normalized.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/fa/e7bba579117db74662d9e9e9e1e2e9/annotatedbyxy/meyer_meyer_treat-m6A-1_normalized.unanno.txt meyer_meyer_treat-m6A-1_normalized.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/31/43f7ecde4682928d206dc35b80a56b/annotatedbyxy/rank_merged_group_control.anno.txt rank_merged_group_control.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/31/43f7ecde4682928d206dc35b80a56b/annotatedbyxy/rank_merged_group_control.peak_bed.center rank_merged_group_control.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/31/43f7ecde4682928d206dc35b80a56b/annotatedbyxy/rank_merged_group_control.refSeq.all.bed rank_merged_group_control.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/31/43f7ecde4682928d206dc35b80a56b/annotatedbyxy/rank_merged_group_control.tmp.refSeq.bed rank_merged_group_control.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/31/43f7ecde4682928d206dc35b80a56b/annotatedbyxy/rank_merged_group_control.unanno.txt rank_merged_group_control.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/97/a5c82be65153a6cb5aa453a2987030/annotatedbyxy/rank_merged_group_treat.anno.txt rank_merged_group_treat.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/97/a5c82be65153a6cb5aa453a2987030/annotatedbyxy/rank_merged_group_treat.peak_bed.center rank_merged_group_treat.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/97/a5c82be65153a6cb5aa453a2987030/annotatedbyxy/rank_merged_group_treat.refSeq.all.bed rank_merged_group_treat.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/97/a5c82be65153a6cb5aa453a2987030/annotatedbyxy/rank_merged_group_treat.tmp.refSeq.bed rank_merged_group_treat.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/97/a5c82be65153a6cb5aa453a2987030/annotatedbyxy/rank_merged_group_treat.unanno.txt rank_merged_group_treat.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b1/3f10f37eb527d08c259ec49ba9b085/annotatedbyxy/rank_merged_allpeaks.anno.txt rank_merged_allpeaks.anno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b1/3f10f37eb527d08c259ec49ba9b085/annotatedbyxy/rank_merged_allpeaks.peak_bed.center rank_merged_allpeaks.peak_bed.center
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b1/3f10f37eb527d08c259ec49ba9b085/annotatedbyxy/rank_merged_allpeaks.refSeq.all.bed rank_merged_allpeaks.refSeq.all.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b1/3f10f37eb527d08c259ec49ba9b085/annotatedbyxy/rank_merged_allpeaks.tmp.refSeq.bed rank_merged_allpeaks.tmp.refSeq.bed
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/b1/3f10f37eb527d08c259ec49ba9b085/annotatedbyxy/rank_merged_allpeaks.unanno.txt rank_merged_allpeaks.unanno.txt
+    ln -s /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/4b/6715a9bf12a1fd60df60d5f5d4fd5b/formatted_designfile.txt formatted_designfile.txt
+}
+
+nxf_unstage() {
+    true
+    [[ ${nxf_main_ret:=0} != 0 ]] && return
+}
+
+nxf_main() {
+    trap on_exit EXIT
+    trap on_term TERM INT USR2
+    trap '' USR1
+
+    [[ "${NXF_CHDIR:-}" ]] && cd "$NXF_CHDIR"
+    export NXF_BOXID="nxf-$(dd bs=18 count=1 if=/dev/urandom 2>/dev/null | base64 | tr +/ 0A)"
+    NXF_SCRATCH=''
+    [[ $NXF_DEBUG > 0 ]] && nxf_env
+    touch /work/users/chenjun/Works/DYQ/meRIP_DYQ_control-treat-m6A_QZP-2021-06-23-01/personalized_analysis/nextflow-test/myrun/meripseqpipe/work/e8/b9beb639ffaee846dfdb3984d10002/.command.begin
+    set +u
+    set -u
+    [[ $NXF_SCRATCH ]] && echo "nxf-scratch-dir $HOSTNAME:$NXF_SCRATCH" && cd $NXF_SCRATCH
+    nxf_stage
+
+    set +e
+    local ctmp=$(set +u; nxf_mktemp /dev/shm 2>/dev/null || nxf_mktemp $TMPDIR)
+    local cout=$ctmp/.command.out; mkfifo $cout
+    local cerr=$ctmp/.command.err; mkfifo $cerr
+    tee .command.out < $cout &
+    tee1=$!
+    tee .command.err < $cerr >&2 &
+    tee2=$!
+    ( nxf_launch ) >$cout 2>$cerr &
+    pid=$!
+    wait $pid || nxf_main_ret=$?
+    wait $tee1 $tee2
+    nxf_unstage
+}
+
+$NXF_ENTRY
