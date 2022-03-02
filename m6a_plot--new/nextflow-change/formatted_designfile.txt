@@ -1,0 +1,5 @@
+Sample_ID,input_FileName,ip_FileName,Group
+control-m6A-1,control-m6A-1.input,control-m6A-1.ip,control
+control-m6A-2,control-m6A-2.input,control-m6A-2.ip,control
+treat-m6A-1,treat-m6A-1.input,treat-m6A-1.ip,treat
+treat-m6A-2,treat-m6A-2.input,treat-m6A-2.ip,treat

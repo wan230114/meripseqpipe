@@ -643,6 +643,7 @@ process Fastp{
 }
 
 process Fastqc{
+    label 'fastp'
     tag "$sample_name"
     publishDir path: { params.skip_fastqc ? params.outdir : "${params.outdir}/QC" },
              saveAs: { params.skip_fastqc ? null : it }, mode: 'link'
@@ -963,6 +964,7 @@ process SortRename {
  * STEP 3-2 - RSeQC analysis
 */
 process RSeQC {
+    label 'RSeQC'
     tag "$output"
     publishDir "${params.outdir}/QC/rseqc" , mode: 'link', overwrite: true,
         saveAs: {filename ->
@@ -1060,6 +1062,7 @@ process GenebodyCoverage {
 Channel
     .from()
     .concat( tophat2_log, hisat2_log, star_log, fastp_results, fastqc_results, rseqc_results)
+    // .concat( tophat2_log, hisat2_log)
     .into{ arranged_qc; qc_results_for_report }
 
 process multiqc{
